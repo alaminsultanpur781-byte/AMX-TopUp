@@ -1,489 +1,558 @@
 <?php 
+include 'common/config.php'; 
+
+// ====================================================
+// 1. AJAX HANDLERS
+// ====================================================
+
+// A. Handle Balance Refresh
+if(isset($_GET['action']) && $_GET['action'] == 'get_balance') {
+    header('Content-Type: application/json');
+    if(isset($_SESSION['user_id'])) {
+        $uid = $_SESSION['user_id'];
+        $res = $conn->query("SELECT balance FROM users WHERE id=$uid");
+        echo json_encode(['balance' => ($res ? $res->fetch_assoc()['balance'] : 0)]);
+    } else {
+        echo json_encode(['balance' => 0]);
+    }
+    exit;
+}
+
+// B. Handle UID Check (API Proxy)
+if(isset($_GET['action']) && $_GET['action'] == 'check_uid_api') {
+    $uid = isset($_GET['uid']) ? trim($_GET['uid']) : '';
+    
+    // API URL provided by you
+    $apiUrl = "https://ffinfodevelopersketvia.vercel.app/player-info?region=SG&uid=" . $uid;
+    
+    // Use cURL to fetch data
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $apiUrl);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    $response = curl_exec($ch);
+    curl_close($ch);
+    
+    // Return raw JSON response to JS
+    header('Content-Type: application/json');
+    echo $response;
+    exit;
+}
+
+// ====================================================
+// 2. PAGE LOAD LOGIC
+// ====================================================
 include 'common/header.php'; 
 
-// ====================================================
-// SELF-HEALING DATABASE
-// ====================================================
-try {
-    $conn->query("CREATE TABLE IF NOT EXISTS games (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255), type VARCHAR(50), category_id INT, description TEXT, image VARCHAR(255), status ENUM('active', 'inactive') DEFAULT 'active')");
-    
-    // Check Columns
-    $checkStatus = $conn->query("SHOW COLUMNS FROM games LIKE 'status'");
-    if($checkStatus && $checkStatus->num_rows == 0) $conn->query("ALTER TABLE games ADD COLUMN status ENUM('active', 'inactive') DEFAULT 'active'");
+if(!isset($_GET['id'])) header("Location: index.php");
+$id = (int)$_GET['id'];
+$game = $conn->query("SELECT * FROM games WHERE id=$id")->fetch_assoc();
+if(!$game) header("Location: index.php");
 
-    $checkCat = $conn->query("SHOW COLUMNS FROM games LIKE 'category_id'");
-    if($checkCat && $checkCat->num_rows == 0) $conn->query("ALTER TABLE games ADD COLUMN category_id INT DEFAULT 0");
+// FIX: Normalize Game Type (Lowercase & Trim) to handle 'Voucher', 'voucher ', etc.
+$gameType = strtolower(trim($game['type']));
 
-    $checkHint = $conn->query("SHOW COLUMNS FROM games LIKE 'hint_text'");
-    if($checkHint && $checkHint->num_rows == 0) $conn->query("ALTER TABLE games ADD COLUMN hint_text VARCHAR(255) DEFAULT NULL");
-
-    $checkUidCheck = $conn->query("SHOW COLUMNS FROM games LIKE 'check_uid'");
-    if($checkUidCheck && $checkUidCheck->num_rows == 0) $conn->query("ALTER TABLE games ADD COLUMN check_uid TINYINT DEFAULT 1");
-
-} catch(Exception $e) {}
-
-// ====================================================
-// INITIALIZE VARIABLES
-// ====================================================
-$editMode = false;
-$editId = 0;
-$name = '';
-$type = 'uid';
-$desc = '';
-$currImg = '';
-$catId = 0;
-$hintText = '';
-$checkUid = 1; 
-$modalOpen = false; 
-
-// EDIT MODE
-if(isset($_GET['edit'])) {
-    $editId = (int)$_GET['edit'];
-    $res = $conn->query("SELECT * FROM games WHERE id=$editId");
-    if($res && $res->num_rows > 0) {
-        $row = $res->fetch_assoc();
-        $editMode = true;
-        $modalOpen = true; 
-        $name = $row['name'];
-        $type = $row['type'];
-        $desc = $row['description'];
-        $currImg = $row['image'];
-        $catId = $row['category_id'] ?? 0;
-        $hintText = $row['hint_text'] ?? '';
-        $checkUid = $row['check_uid'] ?? 1;
+// CHECK: Ensure 'status' column exists in products table (Self-Healing)
+if(isset($conn)) {
+    $chk_st = $conn->query("SHOW COLUMNS FROM products LIKE 'status'");
+    if($chk_st->num_rows == 0) {
+        // Assuming default is 'active' or 1. Let's use ENUM to match admin panel if you updated it there, 
+        // or just rely on whatever column type you set. 
+        // Based on previous context, status might be ENUM('active','inactive').
+        // Let's assume ENUM('active','inactive') based on product.php updates.
+        // If it was TINYINT before, this check handles new columns.
+        $conn->query("ALTER TABLE products ADD COLUMN status ENUM('active', 'inactive') DEFAULT 'active'");
     }
 }
 
-// TOGGLE STATUS
-if(isset($_GET['toggle_status'])) {
-    $gid = (int)$_GET['toggle_status'];
-    $currentStatus = $_GET['status'];
-    $newStatus = ($currentStatus == 'active') ? 'inactive' : 'active';
-    
-    $conn->query("UPDATE games SET status='$newStatus' WHERE id=$gid");
-    echo "<script>window.location='game.php';</script>";
-}
+$products = $conn->query("SELECT * FROM products WHERE game_id=$id ORDER BY price ASC");
 
-// SAVE ACTIONS
-if(isset($_POST['save_game'])) {
-    // FIX: DO NOT use real_escape_string here because we use prepare() later.
-    // Using both causes "\r\n" to appear as text.
-    $n = $_POST['name'];
-    $t = $_POST['type'];
-    $c = (int)$_POST['category_id'];
-    $d = $_POST['description']; // Raw input (Prepared statement handles security)
-    $h = $_POST['hint_text'];
-    $cu = isset($_POST['check_uid']) ? 1 : 0;
-    
-    $finalImage = $editMode ? $currImg : ''; 
-    
-    if(isset($_FILES['image']) && $_FILES['image']['error'] == 0) {
-        $allowed = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
-        $ext = strtolower(pathinfo($_FILES['image']['name'], PATHINFO_EXTENSION));
-        if(in_array($ext, $allowed)) {
-            $newFilename = "game_" . time() . "." . $ext;
-            if(move_uploaded_file($_FILES['image']['tmp_name'], "../uploads/" . $newFilename)) {
-                $finalImage = "uploads/" . $newFilename;
-            }
-        }
-    }
-
-    if(empty($finalImage)) {
-        echo "<script>alert('Image is required!'); window.history.back();</script>";
-    } else {
-        if($editMode) {
-            $uid = (int)$_POST['update_id'];
-            $stmt = $conn->prepare("UPDATE games SET name=?, type=?, category_id=?, description=?, image=?, hint_text=?, check_uid=? WHERE id=?");
-            $stmt->bind_param("ssisssii", $n, $t, $c, $d, $finalImage, $h, $cu, $uid);
-        } else {
-            $stmt = $conn->prepare("INSERT INTO games (name, type, category_id, description, image, hint_text, check_uid, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'active')");
-            $stmt->bind_param("ssisssi", $n, $t, $c, $d, $finalImage, $h, $cu);
-        }
-        
-        if($stmt->execute()) {
-            echo "<script>window.location='game.php';</script>";
-        } else {
-            echo "Error: " . $stmt->error;
-        }
-    }
-}
-
-// DELETE ACTION
-if(isset($_GET['del'])) {
-    $id = (int)$_GET['del'];
-    $conn->query("DELETE FROM games WHERE id=$id");
-    echo "<script>window.location='game.php';</script>";
+// Initial Balance
+$user_balance = 0;
+if(isset($_SESSION['user_id'])) {
+    $uid = $_SESSION['user_id'];
+    $ub = $conn->query("SELECT balance FROM users WHERE id=$uid")->fetch_assoc();
+    $user_balance = $ub['balance'];
 }
 ?>
 
-<script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
-<script src="https://unpkg.com/feather-icons"></script>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Bree+Serif&family=Noto+Serif+Bengali:wght@400;500;600;700&display=swap" rel="stylesheet">
 
 <style>
+    /* =========================================
+       COLOR CONFIGURATION
+       (Matches Header Settings)
+       ========================================= */
     :root {
-        --bg-body: #050505;
-        --bg-card: #111111;
-        --bg-input: #1a1a1a;
-        --border: #222222;
-        --text-primary: #ffffff;
-        --text-secondary: #9ca3af;
-        --accent: #eab308;
-        --red: #ef4444;
+        --primary-color: #DC2626; /* Fallback Red */
     }
 
-    body {
-        background-color: var(--bg-body);
-        color: var(--text-primary);
-        font-family: 'Inter', sans-serif;
-        margin: 0;
-        overflow-x: hidden;
+    /* Global & Fonts */
+    .support-fab, .floating-contact, .whatsapp-float, #support-btn { display: none !important; }
+    body { background-color: #f0f5f9; padding-bottom: 20px; } 
+    .font-bree { font-family: 'Bree Serif', serif; }
+    .font-bangla { font-family: 'Noto Serif Bengali', serif; }
+
+    /* Number Badge */
+    .step-badge {
+        background-color: var(--primary-color);
+        color: white; width: 28px; height: 28px; border-radius: 50%;
+        display: flex; align-items: center; justify-content: center;
+        font-family: 'Bree Serif', serif; font-size: 16px; padding-top: 2px;
     }
 
-    .container-fluid { padding: 20px; max-width: 100%; }
-
-    /* HEADER */
-    .page-header { margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }
-    .page-title { font-size: 24px; font-weight: 700; margin: 0; }
-    .btn-new {
-        background: var(--accent); color: #000; padding: 10px 20px;
-        border-radius: 8px; font-weight: 700; font-size: 13px; border: none; cursor: pointer;
-    }
-
-    /* CARD & TABLE */
-    .table-card {
-        background: var(--bg-card);
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        overflow: hidden;
-        margin-bottom: 30px;
-    }
-
-    .filter-bar {
-        padding: 15px; border-bottom: 1px solid var(--border);
-        display: flex; gap: 10px; align-items: center;
-    }
-    
-    .search-box {
-        flex: 1; background: var(--bg-input); border: 1px solid var(--border);
-        border-radius: 8px; display: flex; align-items: center; padding: 10px 12px;
-    }
-    .search-box input {
-        background: transparent; border: none; outline: none;
-        color: #fff; width: 100%; font-size: 14px; margin-left: 10px;
-    }
-
-    .table-responsive { overflow-x: auto; }
-    table { width: 100%; border-collapse: collapse; min-width: 800px; }
-    
-    th {
-        text-align: left; padding: 15px 20px;
-        color: var(--text-secondary); font-size: 13px; font-weight: 600;
-        border-bottom: 1px solid var(--border); background: #161616;
-    }
-    
-    td {
-        padding: 15px 20px; border-bottom: 1px solid var(--border);
-        font-size: 14px; color: #fff; vertical-align: middle;
-    }
-    
-    tr:last-child td { border-bottom: none; }
-    tr:hover td { background: #1a1a1a; }
-
-    /* MODAL STYLES */
-    .modal {
-        display: none; position: fixed; inset: 0;
-        background: rgba(0,0,0,0.8); z-index: 100;
-        align-items: center; justify-content: center;
-    }
-    
-    <?php if($modalOpen): ?>
-    .modal { display: flex !important; }
-    <?php endif; ?>
-
-    .modal-content {
-        background: var(--bg-card);
-        border: 1px solid var(--border);
-        width: 90%; max-width: 600px;
-        border-radius: 12px; padding: 25px;
+    /* Product Card */
+    .pkg-card {
+        background-color: white;
+        border: 1px solid #e5e7eb;
+        border-radius: 8px;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+        transition: all 0.2s;
+        min-height: 60px; 
         position: relative;
-        max-height: 90vh; overflow-y: auto;
+        overflow: hidden; /* Ensure badges don't spill out */
     }
-    .modal-title { font-size: 20px; font-weight: 700; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 15px; }
+    
+    .pkg-radio:checked + .pkg-card {
+        border-color: var(--primary-color);
+        background-color: #fff1f2; 
+        box-shadow: 0 0 0 1px var(--primary-color);
+    }
+    .pkg-title { color: #1f2937; font-weight: 700; font-size: 13px; line-height: 1.2; }
+    .pkg-price { color: var(--primary-color); font-weight: 600; font-size: 12px; margin-top: 2px; }
 
-    /* FORM */
-    .form-group { margin-bottom: 15px; }
-    .form-label { display: block; font-size: 13px; color: var(--text-secondary); margin-bottom: 8px; font-weight: 600; }
-    .form-input, .form-select, .form-textarea { 
-        width: 100%; background: var(--bg-input); border: 1px solid var(--border);
-        padding: 12px; border-radius: 8px; color: #fff; outline: none; font-size: 14px;
-        font-family: 'Inter', sans-serif;
+    /* --- STOCK OUT STYLES --- */
+    .pkg-disabled {
+        opacity: 0.7;
+        cursor: not-allowed;
     }
-    .form-input:focus { border-color: #444; }
-    .form-textarea { min-height: 100px; resize: vertical; }
-
-    .btn-save {
-        background: var(--accent); color: #000; padding: 12px 24px; width: 100%;
-        border: none; border-radius: 8px; font-weight: 700; cursor: pointer; margin-top: 10px;
-    }
-    .btn-cancel-modal {
-        position: absolute; top: 20px; right: 20px; background: transparent; border: none; color: #666; font-size: 20px; cursor: pointer;
-    }
-    .btn-cancel-modal:hover { color: #fff; }
-
-    /* BADGES & SWITCHES */
-    .type-badge {
-        font-size: 10px; font-weight: 700; padding: 4px 8px; border-radius: 4px; 
-        text-transform: uppercase; letter-spacing: 0.5px; border: 1px solid;
-    }
-    .badge-uid { color: #eab308; border-color: rgba(234, 179, 8, 0.2); background: rgba(234, 179, 8, 0.05); }
-    .badge-voucher { color: #a855f7; border-color: rgba(168, 85, 247, 0.2); background: rgba(168, 85, 247, 0.05); }
-    .badge-subscription { color: #22c55e; border-color: rgba(34, 197, 94, 0.2); background: rgba(34, 197, 94, 0.05); }
-
-    .toggle-switch {
-        position: relative; display: inline-block; width: 36px; height: 20px;
-    }
-    .toggle-switch input { opacity: 0; width: 0; height: 0; }
-    .slider {
-        position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
-        background-color: #4b5563; transition: .4s; border-radius: 34px;
-    }
-    .slider:before {
-        position: absolute; content: ""; height: 16px; width: 16px; left: 2px; bottom: 2px;
-        background-color: white; transition: .4s; border-radius: 50%;
-    }
-    input:checked + .slider { background-color: var(--accent); }
-    input:checked + .slider:before { transform: translateX(16px); }
-
-    /* SMALL TOGGLE FOR MODAL */
-    .small-toggle { width: 40px; height: 22px; }
-    .small-toggle .slider:before { height: 18px; width: 18px; bottom: 2px; left: 2px; }
-    .small-toggle input:checked + .slider:before { transform: translateX(18px); }
-
-    .btn-edit-text {
-        color: var(--accent); font-weight: 600; font-size: 13px;
-        text-decoration: none; display: inline-flex; align-items: center; gap: 4px; margin-right: 15px;
-    }
-    .btn-delete-text {
-        color: var(--red); font-weight: 600; font-size: 13px;
-        text-decoration: none; display: inline-flex; align-items: center; gap: 4px; cursor: pointer;
+    
+    .stock-out-badge {
+        position: absolute;
+        top: 8px; right: -25px; /* Corner positioning */
+        background-color: #ef4444; /* Bright Red */
+        color: white;
+        font-size: 9px;
+        font-weight: 800;
+        padding: 2px 25px;
+        text-transform: uppercase;
+        transform: rotate(45deg); /* Diagonal Corner Badge */
+        box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+        z-index: 10;
+        pointer-events: none;
     }
 
-    /* CONDITIONAL SECTIONS */
-    .conditional-field { display: none; margin-top: 10px; }
+    /* Buttons */
+    .btn-check-bg {
+        background-image: url('res/backgrounds/buttonbg.png');
+        background-size: cover; background-position: center;
+        color: white; text-shadow: 0 1px 2px rgba(0,0,0,0.3); border: none;
+    }
+    .btn-valid-name {
+        background: #10b981 !important;
+        color: white;
+        border: none;
+        box-shadow: none;
+    }
+
+    /* Payment Method */
+    .pay-card { transition: none !important; }
+    
+    .pay-radio:checked + .pay-card { border: 2px solid var(--primary-color); position: relative; }
+    .pay-radio:checked + .pay-card::before {
+        content: ''; position: absolute; top: 0; left: 0; width: 0; height: 0;
+        border-style: solid; border-width: 24px 24px 0 0;
+        border-color: var(--primary-color) transparent transparent transparent; z-index: 1;
+    }
+    .pay-radio:checked + .pay-card::after {
+        content: '✓'; position: absolute; top: -2px; left: 3px;
+        color: white; font-size: 12px; font-weight: bold; z-index: 2;
+    }
+
+    /* 3D Icon */
+    .game-icon-3d {
+        box-shadow: 6px 6px 0px rgba(0,0,0,0.2); 
+        border: 2px solid white;
+        transform: translateY(-2px);
+    }
+    
+    /* Errors & Popups */
+    .error-msg-box {
+        background-color: #fee2e2;
+        border: 1px solid var(--primary-color);
+        color: #b91c1c;
+        font-size: 12px;
+        padding: 8px;
+        border-radius: 6px;
+        margin-top: 8px;
+        display: none; 
+        align-items: center;
+        gap: 6px;
+        font-family: 'Noto Serif Bengali', serif;
+        animation: fadeIn 0.3s ease-in-out;
+    }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: translateY(0); } }
+    
+    .input-error { border: 1px solid var(--primary-color) !important; background-color: #fef2f2; }
+    .sharp-popup { border-radius: 0px !important; box-shadow: 0 0 0 1000px rgba(0,0,0,0.8); aspect-ratio: 3/2; display: flex; flex-direction: column; justify-content: center; align-items: center; width: 90%; max-width: 340px; }
+    .sharp-btn { border-radius: 0px !important; text-transform: uppercase; letter-spacing: 1px; font-weight: 900; }
+    
+    /* Dynamic Classes */
+    .bg-primary { background-color: var(--primary-color) !important; }
+    .text-primary { color: var(--primary-color) !important; }
+    .border-primary { border-color: var(--primary-color) !important; }
+    .hover-text-primary:hover { color: var(--primary-color) !important; }
+    .focus-ring-primary:focus { outline: none; border-color: var(--primary-color); }
 </style>
 
-<div class="container-fluid">
-    
-    <div class="page-header">
-        <h1 class="page-title">Products</h1>
-        <button onclick="openModal()" class="btn-new">New product</button>
+<div class="w-full bg-primary px-4 py-6 flex items-center gap-5 shadow-lg relative overflow-hidden">
+    <div class="absolute inset-0 opacity-10 bg-[url('res/pattern.png')]"></div>
+    <div class="relative z-10 w-20 h-20 rounded-xl overflow-hidden game-icon-3d bg-gray-900">
+        <img src="<?php echo $game['image']; ?>" class="w-full h-full object-cover">
     </div>
-
-    <div class="table-card">
-        
-        <div class="filter-bar">
-            <div class="search-box">
-                <i data-feather="search" style="color: #666; width: 18px;"></i>
-                <input type="text" placeholder="Search products...">
-            </div>
-            <i data-feather="filter" style="color: #666; width: 20px; margin-left: 10px;"></i>
-        </div>
-
-        <div class="table-responsive">
-            <table>
-                <thead>
-                    <tr>
-                        <th width="40"><input type="checkbox" style="accent-color:#eab308;"></th>
-                        <th>Product Title <i data-feather="chevron-down" style="width:14px; vertical-align:middle;"></i></th>
-                        <th>Category</th>
-                        <th>Type</th>
-                        <th>Status</th>
-                        <th>Action</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <?php 
-                    $sql = "SELECT g.*, c.name as cat_name FROM games g LEFT JOIN categories c ON g.category_id = c.id ORDER BY g.id DESC";
-                    $games = $conn->query($sql);
-                    
-                    if($games && $games->num_rows > 0): 
-                        while($row = $games->fetch_assoc()): 
-                            $badge = 'badge-uid';
-                            if($row['type'] == 'voucher') $badge = 'badge-voucher';
-                            if($row['type'] == 'subscription') $badge = 'badge-subscription';
-                            
-                            $status = isset($row['status']) ? $row['status'] : 'active';
-                            $isActive = ($status == 'active');
-                    ?>
-                    <tr>
-                        <td><input type="checkbox" style="accent-color:#eab308;"></td>
-                        <td>
-                            <div style="display:flex; align-items:center; gap:12px;">
-                                <img src="../<?php echo $row['image']; ?>" style="width:40px; height:40px; border-radius:6px; object-fit:cover; background:#222;">
-                                <span style="font-weight:600; color:#fff;"><?php echo htmlspecialchars($row['name']); ?></span>
-                            </div>
-                        </td>
-                        <td style="color:#aaa;"><?php echo htmlspecialchars($row['cat_name'] ?? 'Uncategorized'); ?></td>
-                        <td>
-                            <span class="type-badge <?php echo $badge; ?>"><?php echo strtoupper($row['type']); ?></span>
-                        </td>
-                        <td>
-                            <a href="?toggle_status=<?php echo $row['id']; ?>&status=<?php echo $status; ?>" class="toggle-switch">
-                                <input type="checkbox" <?php echo $isActive ? 'checked' : ''; ?>>
-                                <span class="slider"></span>
-                            </a>
-                        </td>
-                        <td>
-                            <a href="?edit=<?php echo $row['id']; ?>" class="btn-edit-text">
-                                <i data-feather="edit-2" style="width:14px;"></i> Edit
-                            </a>
-                            <a href="javascript:void(0)" onclick="confirmDelete(<?php echo $row['id']; ?>)" class="btn-delete-text">
-                                <i data-feather="trash" style="width:14px;"></i> Delete
-                            </a>
-                        </td>
-                    </tr>
-                    <?php endwhile; else: ?>
-                    <tr><td colspan="6" style="text-align:center; padding:30px; color:#666;">No products found</td></tr>
-                    <?php endif; ?>
-                </tbody>
-            </table>
-        </div>
+    <div class="relative z-10">
+        <h1 class="text-white font-bree text-2xl drop-shadow-md"><?php echo $game['name']; ?></h1>
+        <div class="h-1 w-12 bg-white/30 rounded mt-2"></div>
     </div>
-
 </div>
 
-<div id="gameModal" class="modal">
-    <div class="modal-content">
-        <button type="button" onclick="closeModal()" class="btn-cancel-modal">&times;</button>
-        <h3 class="modal-title">
-            <?php echo $editMode ? 'Edit Product' : 'Add New Product'; ?>
+<form action="instantpay.php" method="POST" id="topupForm" class="container mx-auto px-3 mt-5 max-w-lg" onsubmit="return validateForm(event)">
+    <input type="hidden" name="game_id" value="<?php echo $game['id']; ?>">
+    <input type="hidden" name="action" value="create_order">
+    <input type="hidden" name="order_txid" id="orderTxid">
+    
+    <div class="bg-white p-4 rounded-xl shadow-sm border border-gray-200 mb-4">
+        <h3 class="font-bree text-gray-800 text-lg mb-4 flex items-center gap-3 border-b pb-3">
+            <span class="step-badge">1</span> Select Package
         </h3>
         
-        <form method="POST" enctype="multipart/form-data">
-            <?php if($editMode): ?>
-                <input type="hidden" name="update_id" value="<?php echo $editId; ?>">
-            <?php endif; ?>
+        <div class="grid grid-cols-2 gap-3">
+            <?php while($prod = $products->fetch_assoc()): 
+                // CHECK STATUS: Assume 'active' is available (1 or 'active')
+                // Adjust comparison based on your DB schema (ENUM vs TINYINT)
+                // If using ENUM('active','inactive'):
+                $isActive = ($prod['status'] === 'active');
+                
+                // If you are still using TINYINT(1):
+                // $isActive = ($prod['status'] == 1);
 
-            <div class="form-group">
-                <label class="form-label">Title</label>
-                <input type="text" name="name" class="form-input" value="<?php echo htmlspecialchars($name); ?>" required>
-            </div>
+                $disabledAttr = $isActive ? '' : 'disabled';
+                $cursorClass = $isActive ? 'cursor-pointer' : 'cursor-not-allowed pkg-disabled';
+            ?>
+            <label class="<?php echo $cursorClass; ?> relative group select-none">
+                <input type="radio" name="product_id" value="<?php echo $prod['id']; ?>" 
+                       data-price="<?php echo $prod['price']; ?>" 
+                       data-pname="<?php echo $prod['name']; ?>" 
+                       class="pkg-radio sr-only" 
+                       onchange="updateTotal()" 
+                       <?php echo $disabledAttr; ?>>
+                
+                <div class="pkg-card p-2 h-full flex flex-col justify-center items-center">
+                    <span class="pkg-title font-bree text-center block">
+                        <?php echo $prod['name']; ?>
+                    </span>
+                    <span class="pkg-price font-bree">
+                        BDT <?php echo number_format($prod['price'], 0); ?>
+                    </span>
 
-            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:15px;">
-                <div class="form-group">
-                    <label class="form-label">Category</label>
-                    <select name="category_id" class="form-select">
-                        <option value="0">Select Category</option>
-                        <?php 
-                        $cats = $conn->query("SELECT * FROM categories ORDER BY name ASC");
-                        while($c = $cats->fetch_assoc()): 
-                            $sel = ($c['id'] == $catId) ? 'selected' : '';
-                            echo "<option value='{$c['id']}' $sel>{$c['name']}</option>";
-                        endwhile;
-                        ?>
-                    </select>
+                    <?php if(!$isActive): ?>
+                        <div class="stock-out-badge">STOCK OUT</div>
+                    <?php endif; ?>
                 </div>
-                <div class="form-group">
-                    <label class="form-label">Type</label>
-                    <select name="type" id="typeSelect" class="form-select" onchange="toggleTypeFields()">
-                        <option value="uid" <?php echo $type=='uid'?'selected':''; ?>>UID Topup</option>
-                        <option value="subscription" <?php echo $type=='subscription'?'selected':''; ?>>Subscription</option>
-                        <option value="voucher" <?php echo $type=='voucher'?'selected':''; ?>>Voucher / In-Game</option>
-                    </select>
+            </label>
+            <?php endwhile; ?>
+        </div>
+        
+        <div id="pkgError" class="error-msg-box">
+            <i class="fa-solid fa-circle-exclamation"></i> অনুগ্রহ করে একটি প্যাকেজ সিলেক্ট করুন
+        </div>
+    </div>
+
+    <?php if($gameType == 'uid' || $gameType == 'unipin' || $gameType == 'voucher' || $gameType == 'id'): ?>
+    <div class="bg-white p-4 rounded-xl shadow-sm border border-gray-200 mb-4">
+        <h3 class="font-bree text-gray-800 text-lg mb-4 flex items-center gap-3 border-b pb-3">
+            <span class="step-badge">2</span> Account Info
+        </h3>
+        
+        <div class="space-y-4">
+            <div>
+                <label class="text-sm text-gray-600 block mb-2 font-bangla font-semibold">এখানে প্লেয়ার আইডি কোড দিন</label>
+                <input type="text" id="playerIdInput" name="player_id" placeholder="এখানে প্লেয়ার আইডি কোড দিন" class="w-full border border-gray-300 rounded-lg p-3 text-sm font-bangla focus-ring-primary" autocomplete="off">
+                
+                <div id="idError" class="error-msg-box">
+                    <i class="fa-solid fa-circle-exclamation"></i> দয়া করে প্লেয়ার আইডি দিন
                 </div>
             </div>
-
-            <div id="hintField" class="form-group conditional-field">
-                <label class="form-label">User Hint Text</label>
-                <input type="text" name="hint_text" class="form-input" value="<?php echo htmlspecialchars($hintText); ?>" placeholder="e.g. Enter Email & Password, or Account Info">
-                <p style="font-size:11px; color:#666; margin-top:5px;">This text will be shown above the input box for the user.</p>
-            </div>
-
-            <div id="uidCheckField" class="form-group conditional-field" style="display:flex; justify-content:space-between; align-items:center; background:var(--bg-input); padding:10px; border-radius:8px; border:1px solid var(--border);">
-                <div>
-                    <label class="form-label" style="margin-bottom:0;">UID Name Check</label>
-                    <p style="font-size:11px; color:#666;">Validate player ID using API?</p>
-                </div>
-                <label class="toggle-switch small-toggle">
-                    <input type="checkbox" name="check_uid" <?php echo ($checkUid==1) ? 'checked' : ''; ?>>
-                    <span class="slider"></span>
-                </label>
-            </div>
-
-            <div class="form-group">
-                <label class="form-label">Description</label>
-                <textarea name="description" class="form-textarea"><?php echo htmlspecialchars($desc); ?></textarea>
-            </div>
-
-            <div class="form-group">
-                <label class="form-label">Thumbnail Image</label>
-                <input type="file" name="image" class="form-input" accept="image/*" <?php echo $editMode?'':'required'; ?>>
-                <?php if($editMode && !empty($currImg)): ?>
-                    <img src="../<?php echo $currImg; ?>" style="width:60px; height:60px; border-radius:6px; margin-top:10px; border:1px solid #333;">
-                <?php endif; ?>
-            </div>
-
-            <button type="submit" name="save_game" class="btn-save">
-                <?php echo $editMode ? 'Save Changes' : 'Add Product'; ?>
+            
+            <button type="button" id="btnCheckName" onclick="checkUidName()" class="w-full btn-check-bg py-3 rounded-lg font-bangla text-base font-semibold hover:opacity-95 transition-all shadow-sm flex items-center justify-center gap-2">
+                আপনার গেম আইডির নাম চেক করুন
             </button>
-        </form>
+        </div>
+    </div>
+    <?php else: ?>
+        <input type="hidden" name="player_id" value="Voucher_Request_No_ID">
+    <?php endif; ?>
+
+    <div class="bg-white p-4 rounded-xl shadow-sm border border-gray-200 mb-4">
+        <h3 class="font-bree text-gray-800 text-lg mb-4 flex items-center gap-3 border-b pb-3">
+            <span class="step-badge">3</span> Select one option
+        </h3>
+
+        <div class="grid grid-cols-2 gap-4 mb-4">
+            <label class="cursor-pointer relative">
+                <input type="radio" name="payment_method" value="wallet" checked class="pay-radio sr-only" onchange="toggleWalletCheck(true)">
+                <div class="pay-card border border-gray-200 rounded-lg bg-white overflow-hidden shadow-sm h-full flex flex-col">
+                    <div class="p-4 flex-1 flex items-center justify-center bg-white">
+                        <img src="res/images/walletpay.png" class="h-10 object-contain" alt="Wallet">
+                    </div>
+                    <div class="bg-[#d1d5db] text-center py-1.5 text-xs font-bold text-gray-700 uppercase">
+                        Wallet Pay
+                    </div>
+                </div>
+            </label>
+
+            <label class="cursor-pointer relative">
+                <input type="radio" name="payment_method" value="online" class="pay-radio sr-only" onchange="toggleWalletCheck(false)">
+                <div class="pay-card border border-gray-200 rounded-lg bg-white overflow-hidden shadow-sm h-full flex flex-col">
+                    <div class="p-2 flex-1 flex flex-col items-center justify-center bg-white">
+                        <img src="res/images/instantpay.png" class="h-8 object-contain mb-1" alt="Instant">
+                        <span class="text-[10px] font-bold text-black">Auto Payment</span>
+                    </div>
+                    <div class="bg-[#d1d5db] text-center py-1.5 text-xs font-bold text-gray-700 uppercase">
+                        Instant Pay
+                    </div>
+                </div>
+            </label>
+        </div>
+
+        <div class="text-sm text-gray-600 space-y-2 pl-1 mb-4">
+            <p class="flex items-center gap-2 font-bangla text-gray-500">
+                <i class="fa-solid fa-circle-info"></i> আপনার অ্যাকাউন্ট ব্যালেন্স 
+                <span class="text-primary font-bold">৳ <span id="userBalanceDisplay"><?php echo number_format($user_balance, 2); ?></span></span> 
+                <button type="button" onclick="refreshBalance()" class="text-gray-400 hover-text-primary transition-transform active:rotate-180">
+                    <i class="fa-solid fa-rotate-right" id="refreshIcon"></i>
+                </button>
+            </p>
+            <p class="flex items-center gap-2 font-bangla text-gray-500">
+                <i class="fa-solid fa-circle-info"></i> প্রোডাক্ট কিনতে আপনার প্রয়োজন <span class="font-bold text-primary">৳ <span id="neededPrice">0</span></span>
+            </p>
+            
+            <div id="balanceError" class="error-msg-box">
+                <i class="fa-solid fa-circle-exclamation"></i> আপনার ওয়ালেটে পর্যাপ্ত ব্যালেন্স নেই!
+            </div>
+        </div>
+
+        <button type="submit" id="mainSubmitBtn" class="w-full bg-primary hover:opacity-90 text-white font-bree py-3.5 rounded-lg shadow-md transition-all active:scale-95 text-xl tracking-wide">
+            Buy Now
+        </button>
+    </div>
+
+    <div class="bg-white rounded-xl shadow-sm border border-gray-200 mb-8 font-bangla overflow-hidden">
+        <div class="bg-gray-50 px-4 py-3 border-b border-gray-200">
+            <h3 class="font-bold text-gray-800 text-base">Rules & Conditions</h3>
+        </div>
+        <div class="p-4 text-xs text-gray-700 leading-relaxed space-y-2">
+            <?php 
+            if(!empty($game['description'])) {
+                echo nl2br($game['description']); 
+            } else {
+                echo "No rules found.";
+            }
+            ?>
+        </div>
+    </div>
+</form>
+
+<div id="confirmPopup" class="fixed inset-0 hidden z-[999] flex items-center justify-center">
+    <div class="bg-white p-6 shadow-2xl relative sharp-popup">
+        <div class="w-full flex flex-col items-center justify-center text-center">
+            <div class="text-5xl mb-4 text-primary"><i class="fa-solid fa-circle-question"></i></div>
+            <h2 class="text-xl font-black mb-2 uppercase tracking-wide text-gray-900 font-lato">Confirm Purchase?</h2>
+            <div id="confirmDetails" class="text-gray-600 text-xs mb-6 font-bold leading-relaxed px-4"></div>
+            <div class="flex gap-2 w-full">
+                <button onclick="closeConfirm()" class="flex-1 py-3 text-gray-800 sharp-btn bg-gray-200">CANCEL</button>
+                <button onclick="submitFinalForm()" class="flex-1 py-3 text-white sharp-btn bg-primary">CONFIRM</button>
+            </div>
+        </div>
     </div>
 </div>
 
 <script>
-    feather.replace();
+    let currentPrice = 0;
+    let selectedPackageName = "";
+    let userBalance = <?php echo $user_balance; ?>;
+    let isWalletSelected = true;
 
-    function openModal() {
-        document.getElementById('gameModal').style.display = 'flex';
-        toggleTypeFields(); // Init State
-    }
-
-    function closeModal() {
-        <?php if($editMode): ?>
-        window.location.href = 'game.php';
-        <?php else: ?>
-        document.getElementById('gameModal').style.display = 'none';
-        <?php endif; ?>
-    }
-
-    // TOGGLE LOGIC
-    function toggleTypeFields() {
-        const type = document.getElementById('typeSelect').value;
-        const hintDiv = document.getElementById('hintField');
-        const uidDiv = document.getElementById('uidCheckField');
-
-        // Reset
-        hintDiv.style.display = 'none';
-        uidDiv.style.display = 'none';
-
-        if(type === 'subscription') {
-            hintDiv.style.display = 'block';
-        } else if(type === 'uid') {
-            uidDiv.style.display = 'flex';
+    // --- 0. UNIQUE TXID GENERATOR ---
+    function generateTXID() {
+        const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+        let result = '';
+        for (let i = 0; i < 10; i++) {
+            result += chars.charAt(Math.floor(Math.random() * chars.length));
         }
+        return result;
     }
 
-    // Run on load if in edit mode
-    <?php if($editMode): ?>
-    document.addEventListener('DOMContentLoaded', toggleTypeFields);
-    <?php endif; ?>
+    // --- 1. UID NAME CHECKER FUNCTION ---
+    function checkUidName() {
+        const uidInput = document.getElementById('playerIdInput');
+        const btn = document.getElementById('btnCheckName');
+        
+        if(!uidInput) return;
 
-    function confirmDelete(id) {
-        Swal.fire({
-            title: 'Delete Product?',
-            text: "This will remove the product and related data.",
-            icon: 'warning',
-            background: '#1a1a1a',
-            color: '#fff',
-            showCancelButton: true,
-            confirmButtonColor: '#ef4444',
-            cancelButtonColor: '#333',
-            confirmButtonText: 'Delete'
-        }).then((result) => {
-            if (result.isConfirmed) {
-                window.location.href = "?del=" + id;
+        const uid = uidInput.value.trim();
+
+        if(uid === "") {
+            document.getElementById('idError').style.display = 'flex';
+            uidInput.classList.add('input-error');
+            return;
+        }
+
+        btn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> Checking...';
+        btn.disabled = true;
+
+        fetch('game_detail.php?action=check_uid_api&uid=' + uid)
+            .then(response => response.json())
+            .then(data => {
+                if (data && data.basicInfo && data.basicInfo.nickname) {
+                    btn.innerHTML = '<i class="fa-solid fa-user-check"></i> ' + data.basicInfo.nickname;
+                    btn.classList.remove('btn-check-bg');
+                    btn.classList.add('btn-valid-name');
+                } else {
+                    btn.innerHTML = 'Player Not Found';
+                    setTimeout(() => {
+                        btn.innerHTML = 'আপনার গেম আইডির নাম চেক করুন';
+                        btn.classList.add('btn-check-bg');
+                        btn.classList.remove('btn-valid-name');
+                        btn.disabled = false;
+                    }, 3000);
+                }
+            })
+            .catch(error => {
+                btn.innerHTML = 'Error Checking';
+                setTimeout(() => {
+                    btn.innerHTML = 'আপনার গেম আইডির নাম চেক করুন';
+                    btn.disabled = false;
+                }, 3000);
+            });
+    }
+
+    function updateTotal() {
+        const radios = document.getElementsByName('product_id');
+        for(let r of radios) {
+            if(r.checked) {
+                currentPrice = parseFloat(r.getAttribute('data-price'));
+                selectedPackageName = r.getAttribute('data-pname');
+                break;
             }
-        });
+        }
+        const needed = document.getElementById('neededPrice');
+        if(needed) needed.innerText = currentPrice;
+        
+        const err = document.getElementById('pkgError');
+        if(err) err.style.display = 'none';
     }
+
+    function toggleWalletCheck(isWallet) {
+        isWalletSelected = isWallet;
+        const balErr = document.getElementById('balanceError');
+        if(balErr) balErr.style.display = 'none';
+    }
+
+    function refreshBalance() {
+        const icon = document.getElementById('refreshIcon');
+        const display = document.getElementById('userBalanceDisplay');
+        if(icon) icon.classList.add('fa-spin');
+        
+        fetch('game_detail.php?action=get_balance')
+            .then(res => res.json())
+            .then(data => {
+                userBalance = parseFloat(data.balance);
+                if(display) display.innerText = userBalance.toFixed(2);
+                if(icon) setTimeout(() => icon.classList.remove('fa-spin'), 500);
+            })
+            .catch(() => { if(icon) icon.classList.remove('fa-spin'); });
+    }
+
+    function validateForm(e) {
+        e.preventDefault();
+
+        let valid = true;
+        document.querySelectorAll('.error-msg-box').forEach(el => el.style.display = 'none');
+        document.querySelectorAll('.input-error').forEach(el => el.classList.remove('input-error'));
+        
+        // 1. Package Validation
+        if(currentPrice === 0) {
+            const pkgErr = document.getElementById('pkgError');
+            if(pkgErr) pkgErr.style.display = 'flex';
+            valid = false;
+        }
+
+        // 2. Player ID Validation (Only if visible)
+        const playerId = document.getElementById('playerIdInput');
+        if(playerId && document.body.contains(playerId)) {
+            if(playerId.value.trim() === "") {
+                const idErr = document.getElementById('idError');
+                if(idErr) idErr.style.display = 'flex';
+                playerId.classList.add('input-error');
+                valid = false;
+            }
+        }
+
+        // 3. Balance Validation (Wallet Only)
+        if(isWalletSelected && userBalance < currentPrice) {
+            const balErr = document.getElementById('balanceError');
+            if(balErr) balErr.style.display = 'flex';
+            valid = false;
+        }
+
+        if(valid) {
+            if(isWalletSelected) {
+                const pidVal = playerId ? playerId.value : 'N/A';
+                document.getElementById('confirmDetails').innerHTML = `
+                    <p>Package: ${selectedPackageName}</p>
+                    <p>Total: ৳${currentPrice}</p>
+                    <p>Player ID: ${pidVal}</p>
+                `;
+                document.getElementById('confirmPopup').classList.remove('hidden');
+            } else {
+                const orderTx = document.getElementById('orderTxid');
+                if(orderTx) orderTx.value = generateTXID();
+                
+                const form = document.getElementById('topupForm');
+                form.action = 'instantpay.php';
+                
+                const btn = document.getElementById('mainSubmitBtn');
+                if(btn) btn.disabled = true;
+                
+                form.submit();
+            }
+        }
+        return false;
+    }
+
+    function closeConfirm() {
+        document.getElementById('confirmPopup').classList.add('hidden');
+    }
+
+    function submitFinalForm() {
+        const orderTx = document.getElementById('orderTxid');
+        if(orderTx) orderTx.value = generateTXID();
+        
+        const form = document.getElementById('topupForm');
+        form.action = 'order.php';
+        
+        const btn = document.getElementById('mainSubmitBtn');
+        if(btn) btn.disabled = true;
+        
+        form.submit();
+    }
+    
+    // Initialize
+    updateTotal();
 </script>
+
+<?php 
+include 'common/footer.php'; 
+include 'common/bottom.php'; 
+?>
