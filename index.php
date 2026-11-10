@@ -1,671 +1,437 @@
 <?php 
-// Include Configuration
-include 'common/config.php'; 
 include 'common/header.php'; 
 
 // ====================================================
-// AUTOMATIC DATABASE UPDATE LOGIC
+// HELPER FUNCTION: PERCENTAGE CALCULATION
 // ====================================================
-if(isset($conn)) {
-    // 1. Create Categories Table & Add Status
-    $conn->query("CREATE TABLE IF NOT EXISTS categories (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        name VARCHAR(255) NOT NULL,
-        priority INT DEFAULT 0,
-        status ENUM('active', 'inactive') DEFAULT 'active'
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
-
-    // Ensure status column exists in categories
-    $chk_cat_stat = $conn->query("SHOW COLUMNS FROM categories LIKE 'status'");
-    if($chk_cat_stat->num_rows == 0) {
-        $conn->query("ALTER TABLE categories ADD COLUMN status ENUM('active', 'inactive') DEFAULT 'active'");
+function calculateGrowth($current, $previous) {
+    if ($previous == 0) {
+        return ($current > 0) ? 100 : 0;
     }
-
-    // 2. Add category_id to games table
-    $chk_col = $conn->query("SHOW COLUMNS FROM games LIKE 'category_id'");
-    if($chk_col->num_rows == 0) {
-        $conn->query("ALTER TABLE games ADD COLUMN category_id INT DEFAULT 0");
-    }
-
-    // 3. Add Popup Settings
-    $settings_to_add = [
-        'popup_image' => '',
-        'popup_link' => '#',
-        'popup_btn_text' => 'See Offer',
-        'popup_text' => ''
-    ];
-    
-    foreach($settings_to_add as $key => $default) {
-        $chk_set = $conn->query("SELECT id FROM settings WHERE name='$key'");
-        if($chk_set->num_rows == 0) {
-            $conn->query("INSERT INTO settings (name, value) VALUES ('$key', '$default')");
-        }
-    }
+    return round((($current - $previous) / $previous) * 100, 1); // 1 decimal place
 }
 
 // ====================================================
-// FETCH DATA
+// 1. REVENUE STATISTICS
 // ====================================================
+// Total Revenue (All time)
+$rev_query = $conn->query("SELECT SUM(amount) FROM orders WHERE status='completed'");
+$total_revenue = ($rev_query && $row = $rev_query->fetch_row()) ? $row[0] : 0;
 
-// Fetch Notice
-$notice_text = ""; 
-if(function_exists('getSetting')) {
-    $notice_text = getSetting($conn, 'home_notice');
-}
+// Current Month Revenue
+$cur_rev_q = $conn->query("SELECT SUM(amount) FROM orders WHERE status='completed' AND MONTH(created_at) = MONTH(CURRENT_DATE()) AND YEAR(created_at) = YEAR(CURRENT_DATE())");
+$current_month_revenue = ($cur_rev_q && $row = $cur_rev_q->fetch_row()) ? $row[0] : 0;
 
-// Fetch Popup Data
-$popup_img = getSetting($conn, 'popup_image');
-$popup_link = getSetting($conn, 'popup_link');
-$popup_btn = getSetting($conn, 'popup_btn_text');
-$popup_text = getSetting($conn, 'popup_text'); 
+// Last Month Revenue
+$last_rev_q = $conn->query("SELECT SUM(amount) FROM orders WHERE status='completed' AND MONTH(created_at) = MONTH(CURRENT_DATE() - INTERVAL 1 MONTH) AND YEAR(created_at) = YEAR(CURRENT_DATE() - INTERVAL 1 MONTH)");
+$last_month_revenue = ($last_rev_q && $row = $last_rev_q->fetch_row()) ? $row[0] : 0;
 
-// Fetch Latest 5 Completed Orders
-$latest_orders = [];
-if(isset($conn)) {
-    $order_query = $conn->query("
-        SELECT o.id, u.name AS user_name, u.image AS user_image, p.name AS product_name, o.amount 
-        FROM orders o
-        JOIN users u ON o.user_id = u.id
-        JOIN products p ON o.product_id = p.id
-        WHERE o.status = 'completed'
-        ORDER BY o.created_at DESC
-        LIMIT 5
-    ");
-    if($order_query){
-        while($row = $order_query->fetch_assoc()){ $latest_orders[] = $row; }
-    }
-}
+$revenue_growth = calculateGrowth($current_month_revenue, $last_month_revenue);
 
+
+// ====================================================
+// 2. USER STATISTICS
+// ====================================================
+// Total Users
+$users_query = $conn->query("SELECT COUNT(*) FROM users");
+$total_users = $users_query ? $users_query->fetch_row()[0] : 0;
+
+// Current Month Users
+$cur_user_q = $conn->query("SELECT COUNT(*) FROM users WHERE MONTH(created_at) = MONTH(CURRENT_DATE()) AND YEAR(created_at) = YEAR(CURRENT_DATE())");
+$current_month_users = ($cur_user_q && $row = $cur_user_q->fetch_row()) ? $row[0] : 0;
+
+// Last Month Users
+$last_user_q = $conn->query("SELECT COUNT(*) FROM users WHERE MONTH(created_at) = MONTH(CURRENT_DATE() - INTERVAL 1 MONTH) AND YEAR(created_at) = YEAR(CURRENT_DATE() - INTERVAL 1 MONTH)");
+$last_month_users = ($last_user_q && $row = $last_user_q->fetch_row()) ? $row[0] : 0;
+
+$user_growth = calculateGrowth($current_month_users, $last_month_users);
+
+
+// ====================================================
+// 3. ORDER STATISTICS
+// ====================================================
+// Total Orders
+$orders_query = $conn->query("SELECT COUNT(*) FROM orders");
+$total_orders = $orders_query ? $orders_query->fetch_row()[0] : 0;
+
+// Current Month Orders
+$cur_ord_q = $conn->query("SELECT COUNT(*) FROM orders WHERE MONTH(created_at) = MONTH(CURRENT_DATE()) AND YEAR(created_at) = YEAR(CURRENT_DATE())");
+$current_month_orders = ($cur_ord_q && $row = $cur_ord_q->fetch_row()) ? $row[0] : 0;
+
+// Last Month Orders
+$last_ord_q = $conn->query("SELECT COUNT(*) FROM orders WHERE MONTH(created_at) = MONTH(CURRENT_DATE() - INTERVAL 1 MONTH) AND YEAR(created_at) = YEAR(CURRENT_DATE() - INTERVAL 1 MONTH)");
+$last_month_orders = ($last_ord_q && $row = $last_ord_q->fetch_row()) ? $row[0] : 0;
+
+$order_growth = calculateGrowth($current_month_orders, $last_month_orders);
+
+
+// ====================================================
+// FETCH RECENT ORDERS
+// ====================================================
+$recent_orders = $conn->query("
+    SELECT o.*, u.name as user_name, g.name as game_name 
+    FROM orders o 
+    LEFT JOIN users u ON o.user_id = u.id 
+    LEFT JOIN games g ON o.game_id = g.id 
+    ORDER BY o.created_at DESC LIMIT 10
+");
 ?>
 
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Bree+Serif&family=Lato:wght@400;700;900&family=Noto+Serif+Bengali:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 
 <style>
-    /* =========================================
-       COLOR CONFIGURATION
-       ========================================= */
     :root {
-        --primary-color: #DC2626;       
-        --primary-color-dark: #b91c1c;  
+        --bg-body: #050505;
+        --bg-card: #111111; /* Very dark card background */
+        --border: #222222;
+        --text-primary: #ffffff;
+        --text-secondary: #9ca3af; /* Grayish text */
+        --accent-green: #4ade80; /* Bright Green */
     }
 
-    /* GLOBAL FONT - REST OF SITE USES BREE SERIF */
-    body { 
-        font-family: 'Bree Serif', serif; 
-        background-image: url('res/backgrounds/bg.png');
-        background-repeat: repeat;
-        background-size: 100% auto; 
-        background-attachment: scroll; 
-        background-position: top center;
-    }
+    /* Reset & Base */
+    * { box-sizing: border-box; }
     
-    .sharp-edge { border-radius: 0px !important; }
-
-    .slider-aspect {
-        aspect-ratio: 2 / 1;
-        width: 100%;
-        overflow: hidden;
-        position: relative;
+    body {
+        background-color: var(--bg-body);
+        color: var(--text-primary);
+        font-family: 'Inter', sans-serif;
+        margin: 0;
+        padding: 0;
+        overflow-x: hidden; 
     }
 
-    /* NOTICE STYLES */
-    .notice-box {
-        background-color: var(--primary-color); 
-        color: white;
-        border-radius: 0px; 
-        padding: 10px 15px; 
-        position: relative;
-        margin-bottom: 10px; 
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-    .notice-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: 4px;
-    }
-    
-    /* Notice Title uses Sharp Font (Lato) */
-    .notice-title { 
-        font-size: 18px; 
-        font-family: 'Lato', sans-serif; 
-        font-weight: 900; 
-        letter-spacing: 0.5px;
-    }
-    
-    .notice-close { font-size: 18px; cursor: pointer; opacity: 0.9; transition: opacity 0.2s; }
-    .notice-close:hover { opacity: 1; transform: scale(1.1); }
-    
-    /* Notice Content is BOLD */
-    .notice-content { 
-        font-size: 13px; 
-        font-family: 'Lato', 'Noto Serif Bengali', sans-serif; 
-        line-height: 1.4; 
-        opacity: 1; 
-        font-weight: 700; /* Bold */
+    .dashboard-container {
+        padding: 15px; 
+        max-width: 100%;
+        margin: 0 auto;
     }
 
-    /* DIVIDER */
-    .divider-container {
-        display: flex; align-items: center; text-align: center; margin: 20px 0 10px 0; 
-    }
-    .divider-line {
-        flex: 1; height: 2px;
-        background: linear-gradient(to var(--dir), #FFD700, var(--primary-color)); 
-    }
-    .divider-text {
-        font-size: 1.4rem; padding: 0 1rem; color: #000000; font-weight: 700; text-transform: lowercase;
-    }
-    .divider-text::first-letter { text-transform: uppercase; }
+    h1 { margin: 0 0 20px 0; font-size: 20px; font-weight: 600; padding-left: 5px; color: #fff; }
 
-    /* SLIDER */
-    #slider { display: flex; transition: transform 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94); cursor: grab; }
-    #slider:active { cursor: grabbing; }
-    .game-card-img { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; border: 1px solid #e2e8f0; }
-    .dot-active { background-color: #000000 !important; }
-    .dot-inactive { background-color: #d1d5db !important; }
-
-    /* --- POPUP UI --- */
-    #homePopupOverlay {
-        position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-        background-color: rgba(0, 0, 0, 0.8);
-        z-index: 10005; display: none; 
-        align-items: center; justify-content: center;
-        padding: 15px;
-    }
-    
-    .popup-wrapper {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        max-width: 400px;
-        width: 100%;
-        animation: popupPop 0.25s ease-out; /* Fast/First animation */
-        position: relative; 
-    }
-
-    @keyframes popupPop {
-        0% { transform: scale(0.9); opacity: 0; }
-        100% { transform: scale(1); opacity: 1; }
-    }
-    
-    .popup-card {
-        background: #fff;
-        width: 100%;
-        border-radius: 12px;
-        overflow: hidden;
-        position: relative;
-        box-shadow: none !important; /* No Shadow */
-        padding-bottom: 30px; 
-    }
-
-    .popup-img-box { width: 100%; background: #000; }
-    .popup-img-box img { display: block; width: 100%; height: auto; }
-
-    .popup-body { padding: 20px 20px 0px 20px; text-align: center; }
-    
-    .popup-text-content {
-        font-size: 14px;
-        color: #333;
-        line-height: 1.5;
-        margin-bottom: 15px;
-        font-family: 'Lato', 'Noto Serif Bengali', sans-serif;
-    }
-
-    .popup-action-btn {
-        background: var(--primary-color);
-        color: white;
-        padding: 10px 20px;
-        border-radius: 6px;
-        font-family: 'Lato', sans-serif;
-        font-weight: 700;
-        display: inline-block;
-        font-size: 14px;
-        text-decoration: none;
-        border: none;
-        box-shadow: 0 2px 5px rgba(220, 38, 38, 0.4);
-    }
-
-    .popup-bottom-close {
-        position: absolute;
-        bottom: -20px; 
-        left: 50%;
-        transform: translateX(-50%);
-        background: var(--primary-color);
-        color: white;
-        border: 2px solid #fff;
-        padding: 8px 30px;
-        border-radius: 50px;
-        font-weight: 900;
-        font-size: 14px;
-        cursor: pointer;
-        font-family: 'Lato', sans-serif;
-        display: flex; align-items: center; justify-content: center; gap: 6px;
-        box-shadow: 0 4px 10px rgba(0,0,0,0.3);
-        transition: transform 0.2s, bottom 0.2s;
-        z-index: 10;
-    }
-    .popup-bottom-close:hover { transform: translateX(-50%) scale(1.05); }
-
-    /* --- LATEST ORDERS SECTION (YOUTUBE STYLE) --- */
-    .latest-orders-container {
-        background: #fff;
-        border-radius: 12px;
-        padding: 20px;
-        margin: 20px 0;
-        box-shadow: 0 2px 10px rgba(0,0,0,0.05);
-        text-align: center;
-    }
-    .latest-orders-title {
-        font-family: 'Lato', sans-serif;
-        font-weight: 700;
-        font-size: 20px;
-        color: #000;
-        margin-bottom: 5px;
-    }
-    .latest-orders-subtitle {
-        font-family: 'Noto Serif Bengali', sans-serif;
-        font-size: 14px;
-        color: #666;
+    /* GRID SYSTEM */
+    .grid-stats {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        gap: 12px;
         margin-bottom: 20px;
     }
-    .latest-orders-subtitle span { color: var(--primary-color); font-weight: 700; }
-    
-    .order-card {
-        background: #fff;
-        border: 1px solid #e5e7eb;
-        border-radius: 12px; /* Smoother corners */
-        padding: 12px;
-        margin-bottom: 10px;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
+
+    .grid-charts {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(100%, 1fr));
+        gap: 12px;
+        margin-bottom: 20px;
     }
-    
-    .order-user-info {
-        display: flex;
-        align-items: center; /* Center Vertically like YouTube */
-        width: 100%;
-        overflow: hidden; /* Prevent text overflow */
-        padding-right: 10px;
+    @media (min-width: 768px) {
+        .grid-charts { grid-template-columns: 1fr 1fr; }
     }
 
-    /* YOUTUBE STYLE AVATAR */
-    .order-user-img {
-        width: 40px;      /* Standard Avatar Size */
-        height: 40px;
-        border-radius: 50%; /* Perfect Circle */
-        object-fit: cover;
-        background: #f3f4f6;
-        flex-shrink: 0;   /* Prevent Squashing */
-        margin-right: 12px; /* Spacing between avatar and text */
-        border: none;     /* YouTube avatars usually don't have borders */
-    }
-
-    .order-text-group {
+    /* === NEW CARD DESIGN (MATCHING IMAGE) === */
+    .card {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: 16px; /* Smooth rounded corners */
+        padding: 24px;
+        position: relative;
+        overflow: hidden;
         display: flex;
         flex-direction: column;
-        align-items: flex-start;
-        text-align: left;
-        min-width: 0; /* Important for text truncation */
+        justify-content: flex-start;
+        min-height: 160px;
+        /* box-shadow removed */
     }
 
-    .order-user-name {
-        font-family: 'Lato', sans-serif;
-        font-weight: 700;
-        font-size: 14px;
-        color: #0f0f0f; /* YouTube Dark Black */
-        line-height: 1.2;
-        margin-bottom: 2px;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        max-width: 100%;
-    }
-    .order-details {
-        font-family: 'Lato', sans-serif;
-        font-size: 12px;
-        color: #606060; /* YouTube Gray */
-        line-height: 1.2;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        max-width: 100%;
+    .card-label { 
+        font-size: 14px; 
+        color: var(--text-secondary); 
+        margin-bottom: 8px; 
+        font-weight: 500; 
     }
     
-    .order-status {
-        background: #22c55e;
-        color: white;
-        padding: 4px 12px;
-        border-radius: 16px;
-        font-family: 'Lato', sans-serif;
-        font-weight: 600;
-        font-size: 11px;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-        white-space: nowrap;
-        margin-left: auto; /* Push to right */
-        flex-shrink: 0;
+    .card-value { 
+        font-size: 32px; 
+        font-weight: 700; 
+        color: #fff; 
+        margin-bottom: 8px;
+        letter-spacing: -0.5px;
+    }
+    
+    .trend-container {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 13px;
+        color: var(--accent-green);
+        font-weight: 500;
+        z-index: 10;
+        position: relative;
     }
 
-    /* Mobile Responsiveness for Orders */
-    @media (max-width: 480px) {
-        .latest-orders-container { padding: 15px 10px; }
-        .order-card { padding: 10px; }
-        .order-user-img { width: 35px; height: 35px; margin-right: 10px; }
-        .order-user-name { font-size: 13px; }
-        .order-details { font-size: 11px; }
-        .order-status { font-size: 10px; padding: 3px 8px; }
+    .trend-arrow { font-size: 14px; }
+
+    /* WAVE GRAPH (SPARKLINE) */
+    .sparkline-wrapper {
+        position: absolute;
+        bottom: 0;
+        left: 0;
+        width: 100%;
+        height: 50px; /* Height of the wave */
+        z-index: 1;
+        opacity: 1;
     }
+
+    /* CHART BOXES */
+    .chart-box {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 20px;
+        width: 100%;
+    }
+    .chart-header { font-size: 15px; font-weight: 600; margin-bottom: 15px; color: #d1d5db; }
+
+    /* TABLE SECTION */
+    .table-box {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 20px;
+        width: 100%;
+        overflow: hidden;
+    }
+    
+    .table-top {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 15px;
+        flex-wrap: wrap;
+        gap: 10px;
+    }
+
+    .search-input {
+        background: #1a1a1a;
+        border: 1px solid var(--border);
+        color: white;
+        padding: 8px 12px;
+        border-radius: 8px;
+        width: 100%;
+        max-width: 250px;
+        font-size: 13px;
+        outline: none;
+    }
+
+    /* RESPONSIVE TABLE */
+    .table-responsive { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    table { width: 100%; border-collapse: collapse; min-width: 650px; }
+    
+    th { 
+        text-align: left; 
+        color: var(--text-secondary); 
+        font-size: 12px; 
+        font-weight: 600; 
+        padding: 12px 0; 
+        border-bottom: 1px solid var(--border); 
+        white-space: nowrap;
+    }
+    
+    td { 
+        padding: 16px 0; 
+        border-bottom: 1px solid var(--border); 
+        font-size: 13px; 
+        color: #e5e5e5; 
+        vertical-align: middle;
+    }
+    
+    tr:last-child td { border-bottom: none; }
+
+    /* STATUS BADGES */
+    .status-badge {
+        padding: 4px 8px;
+        border-radius: 6px;
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+        display: inline-block;
+        white-space: nowrap;
+    }
+    .st-pending { background: rgba(234, 179, 8, 0.1); color: #facc15; }
+    .st-completed { background: rgba(34, 197, 94, 0.1); color: #4ade80; }
+    .st-cancelled { background: rgba(239, 68, 68, 0.1); color: #f87171; }
 
 </style>
 
-<?php if(!empty($popup_img) || !empty($popup_text)): ?>
-<div id="homePopupOverlay">
-    <div class="popup-wrapper">
+<div class="dashboard-container">
+    
+    <div class="grid-stats">
         
-        <div class="popup-card">
-            <?php if(!empty($popup_img)): ?>
-            <div class="popup-img-box">
-                <img src="<?php echo $popup_img; ?>" alt="Offer">
+        <div class="card">
+            <div class="card-label">Revenue</div>
+            <div class="card-value">BDT <?php echo number_format((float)$total_revenue, 2); ?></div>
+            <div class="trend-container">
+                Increase by <?php echo $revenue_growth; ?>% in this month 
+                <i class="fa-solid fa-arrow-trend-up trend-arrow"></i>
             </div>
-            <?php endif; ?>
-
-            <div class="popup-body">
-                <?php if(!empty($popup_text)): ?>
-                <div class="popup-text-content">
-                    <?php echo nl2br(htmlspecialchars($popup_text)); ?>
-                </div>
-                <?php endif; ?>
-
-                <?php if(!empty($popup_btn)): ?>
-                <a href="<?php echo $popup_link; ?>" class="popup-action-btn">
-                    <?php echo htmlspecialchars($popup_btn); ?>
-                </a>
-                <?php endif; ?>
+            <div class="sparkline-wrapper">
+                <canvas id="sparkRevenue"></canvas>
             </div>
         </div>
 
-        <button class="popup-bottom-close" onclick="closeHomePopup()">
-            <i class="fa-solid fa-xmark"></i> CLOSE
-        </button>
+        <div class="card">
+            <div class="card-label">New customers</div>
+            <div class="card-value"><?php echo number_format((int)$total_users); ?></div>
+            <div class="trend-container">
+                Increase by <?php echo $user_growth; ?>% in this month 
+                <i class="fa-solid fa-arrow-trend-up trend-arrow"></i>
+            </div>
+            <div class="sparkline-wrapper">
+                <canvas id="sparkUsers"></canvas>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-label">New orders</div>
+            <div class="card-value"><?php echo number_format((int)$total_orders); ?></div>
+            <div class="trend-container">
+                Increase by <?php echo $order_growth; ?>% in this month 
+                <i class="fa-solid fa-arrow-trend-up trend-arrow"></i>
+            </div>
+            <div class="sparkline-wrapper">
+                <canvas id="sparkOrders"></canvas>
+            </div>
+        </div>
 
     </div>
+
+    <div class="grid-charts">
+        <div class="chart-box">
+            <div class="chart-header">Orders per month</div>
+            <div style="height: 200px;">
+                <canvas id="mainOrdersChart"></canvas>
+            </div>
+        </div>
+        <div class="chart-box">
+            <div class="chart-header">Users per month</div>
+            <div style="height: 200px;">
+                <canvas id="mainUsersChart"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <div class="table-box">
+        <div class="table-top">
+            <div class="chart-header" style="margin:0; font-size:16px;">Latest Orders</div>
+            <input type="text" class="search-input" placeholder="Search orders...">
+        </div>
+
+        <div class="table-responsive">
+            <table>
+                <thead>
+                    <tr>
+                        <th width="15%">Order Date</th>
+                        <th width="15%">Order ID</th>
+                        <th width="20%">User</th>
+                        <th width="20%">Product</th>
+                        <th width="15%">Amount</th>
+                        <th width="15%">Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php if($recent_orders && $recent_orders->num_rows > 0): 
+                        while($row = $recent_orders->fetch_assoc()): 
+                            $st = isset($row['status']) ? strtolower($row['status']) : 'pending';
+                            $userName = isset($row['user_name']) ? $row['user_name'] : 'Guest';
+                            $gameName = isset($row['game_name']) ? $row['game_name'] : 'Unknown';
+                            $amount = isset($row['amount']) ? $row['amount'] : 0;
+                            $orderId = isset($row['id']) ? $row['id'] : '#';
+                            $date = isset($row['created_at']) ? date('M d, Y', strtotime($row['created_at'])) : '-';
+
+                            $badge = 'st-pending';
+                            if($st == 'completed') $badge = 'st-completed';
+                            if($st == 'cancelled') $badge = 'st-cancelled';
+                    ?>
+                    <tr>
+                        <td style="color:#9ca3af;"><?php echo $date; ?></td>
+                        <td style="font-family: monospace; color:#6b7280; font-size:12px;"><?php echo $orderId; ?></td>
+                        <td><?php echo htmlspecialchars($userName ?? ''); ?></td>
+                        <td style="color:#9ca3af;"><?php echo htmlspecialchars($gameName ?? ''); ?></td>
+                        <td style="font-weight: 600;">BDT <?php echo number_format((float)$amount); ?></td>
+                        <td><span class="status-badge <?php echo $badge; ?>"><?php echo ucfirst($st); ?></span></td>
+                    </tr>
+                    <?php endwhile; else: ?>
+                    <tr><td colspan="6" style="text-align:center; padding: 20px; color:#6b7280;">No recent orders found</td></tr>
+                    <?php endif; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
 </div>
 
 <script>
-    document.addEventListener('DOMContentLoaded', () => {
-        document.getElementById('homePopupOverlay').style.display = 'flex';
-    });
-
-    function closeHomePopup() {
-        document.getElementById('homePopupOverlay').style.display = 'none';
-    }
-</script>
-<?php endif; ?>
-
-
-<?php if(!empty($notice_text)): ?>
-<div class="container mx-auto px-4 mt-4">
-    <div class="notice-box">
-        <div class="notice-header">
-            <span class="notice-title">Notice</span>
-            <i class="fa-solid fa-xmark notice-close" onclick="this.closest('.notice-box').style.display='none'"></i>
-        </div>
-        <div class="notice-content">
-            <?php echo nl2br(htmlspecialchars($notice_text)); ?>
-        </div>
-    </div>
-</div>
-<?php endif; ?>
-
-<div class="container mx-auto px-4">
-    <?php 
-    $slides_arr = [];
-    if(isset($conn)) {
-        $slider_query = $conn->query("SELECT * FROM sliders");
-        if($slider_query){
-            while($row = $slider_query->fetch_assoc()){ $slides_arr[] = $row; }
+    // Config for the Wave Effect (Sparkline)
+    const sparkConfig = {
+        type: 'line',
+        data: {
+            labels: [1, 2, 3, 4, 5, 6, 7],
+            datasets: [{
+                data: [10, 25, 18, 30, 25, 40, 50], // Dummy Data for wave visual
+                borderColor: '#4ade80', // Green Color
+                borderWidth: 2,
+                tension: 0.5, // High tension for smooth wave
+                pointRadius: 0, // No dots
+                fill: false
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: false }, tooltip: { enabled: false } },
+            scales: { x: { display: false }, y: { display: false } },
+            layout: { padding: 0 }
         }
-    }
-    $total_slides = count($slides_arr);
-    ?>
+    };
 
-    <div class="relative w-full sharp-edge shadow-sm bg-gray-100 slider-aspect group">
-        <div id="slider" class="h-full w-full">
-            <?php if($total_slides > 0): ?>
-                <?php foreach($slides_arr as $slide): ?>
-                    <a href="<?php echo $slide['link'] ? $slide['link'] : '#'; ?>" class="min-w-full h-full block select-none">
-                        <img src="<?php echo $slide['image']; ?>" class="w-full h-full object-fill pointer-events-none" alt="Slide">
-                    </a>
-                <?php endforeach; ?>
-            <?php else: ?>
-                <div class="w-full h-full flex items-center justify-center text-gray-400 font-normal">No Banners Found</div>
-            <?php endif; ?>
-        </div>
-    </div>
+    // Render Wave Charts
+    new Chart(document.getElementById('sparkRevenue'), JSON.parse(JSON.stringify(sparkConfig)));
+    new Chart(document.getElementById('sparkUsers'), JSON.parse(JSON.stringify(sparkConfig)));
+    new Chart(document.getElementById('sparkOrders'), JSON.parse(JSON.stringify(sparkConfig)));
 
-    <?php if($total_slides > 1): ?>
-    <div class="flex justify-center gap-2 mt-3 mb-6">
-        <?php for($i = 0; $i < $total_slides; $i++): ?>
-            <button onclick="goToSlide(<?php echo $i; ?>)" 
-                    class="slider-dot h-1 w-6 sharp-edge transition-all duration-300 <?php echo ($i === 0) ? 'dot-active' : 'dot-inactive'; ?>" 
-                    data-index="<?php echo $i; ?>">
-            </button>
-        <?php endfor; ?>
-    </div>
-    <?php endif; ?>
-</div>
-
-<div class="container mx-auto px-4 pb-6">
-    <?php 
-    if(isset($conn)) {
-        // FILTER: Only show active categories
-        $cat_query = $conn->query("SELECT * FROM categories WHERE status = 'active' ORDER BY priority ASC, id ASC");
-        
-        $has_categories = ($cat_query && $cat_query->num_rows > 0);
-        
-        function renderGameGrid($conn, $cat_id = null) {
-            $sql = "SELECT * FROM games WHERE status = 'active'"; // FILTER: Only show active games
-            if($cat_id !== null) {
-                $sql .= " AND category_id = $cat_id";
-            } else {
-                $sql .= " AND category_id = 0";
+    // Main Chart Config
+    const mainChartConfig = (ctx, label) => {
+        return new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: ['Feb 1', 'Feb 5', 'Feb 10', 'Feb 15', 'Feb 20'],
+                datasets: [{
+                    label: label,
+                    data: [10, 25, 20, 35, 30], // Replace with real PHP JSON data if needed
+                    borderColor: '#4ade80',
+                    backgroundColor: 'rgba(74, 222, 128, 0.05)',
+                    borderWidth: 2,
+                    tension: 0.4,
+                    pointBackgroundColor: '#111',
+                    pointBorderColor: '#4ade80',
+                    pointRadius: 4,
+                    fill: true
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { legend: { display: false } },
+                scales: {
+                    x: { grid: { color: '#222' }, ticks: { color: '#6b7280', font: {size: 11} } },
+                    y: { grid: { color: '#222' }, ticks: { color: '#6b7280', font: {size: 11} } }
+                }
             }
-            
-            $games = $conn->query($sql);
-            
-            if($games && $games->num_rows > 0): ?>
-                <div class="grid grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4 mt-6">
-                    <?php while($game = $games->fetch_assoc()): ?>
-                        <a href="game_detail.php?id=<?php echo $game['id']; ?>" class="block group">
-                            <div class="sharp-edge overflow-hidden mb-2 relative bg-white shadow-sm">
-                                <img src="<?php echo $game['image']; ?>" class="game-card-img" alt="<?php echo $game['name']; ?>">
-                            </div>
-                            
-                            <div class="text-center">
-                                <h3 class="text-black text-xs md:text-sm font-normal leading-tight uppercase">
-                                    <?php echo $game['name']; ?>
-                                </h3>
-                            </div>
-                        </a>
-                    <?php endwhile; ?>
-                </div>
-            <?php else: ?>
-                <?php endif; 
-        }
-
-        if($has_categories) {
-            while($cat = $cat_query->fetch_assoc()) {
-                // Check if this category actually has active games before showing title
-                $check_games = $conn->query("SELECT id FROM games WHERE category_id = {$cat['id']} AND status = 'active' LIMIT 1");
-                if($check_games && $check_games->num_rows > 0):
-                ?>
-                <div class="divider-container px-2">
-                    <div class="divider-line" style="--dir: left;"></div>
-                    <h2 class="divider-text">
-                        <?php echo htmlspecialchars($cat['name']); ?>
-                    </h2>
-                    <div class="divider-line" style="--dir: right;"></div>
-                </div>
-
-                <?php renderGameGrid($conn, $cat['id']); ?>
-                <?php
-                endif;
-            }
-            
-            // Check unassigned
-            $uncat_chk = $conn->query("SELECT id FROM games WHERE category_id = 0 AND status = 'active' LIMIT 1");
-            if($uncat_chk && $uncat_chk->num_rows > 0) {
-                 ?>
-                 <div class="divider-container px-2 mt-8">
-                    <div class="divider-line" style="--dir: left;"></div>
-                    <h2 class="divider-text">Others</h2>
-                    <div class="divider-line" style="--dir: right;"></div>
-                </div>
-                <?php renderGameGrid($conn, 0); 
-            }
-
-        } else {
-            // No Categories: Show All Active Games
-            $all_chk = $conn->query("SELECT id FROM games WHERE status = 'active' LIMIT 1");
-            if($all_chk && $all_chk->num_rows > 0):
-            ?>
-            <div class="divider-container px-2">
-                <div class="divider-line" style="--dir: left;"></div>
-                <h2 class="divider-text">All Games</h2>
-                <div class="divider-line" style="--dir: right;"></div>
-            </div>
-            <?php renderGameGrid($conn, null); 
-            endif;
-        }
-    } 
-    ?>
-</div>
-
-<div class="container mx-auto px-4 pb-12">
-    <div class="latest-orders-container">
-        <h2 class="latest-orders-title">Latest Orders</h2>
-        <p class="latest-orders-subtitle">সবচেয়ে সাম্প্রতিক <span>5টি অর্ডার</span> এক নজরে</p>
-        
-        <?php if(!empty($latest_orders)): ?>
-            <?php foreach($latest_orders as $order): ?>
-                <div class="order-card">
-                    <div class="order-user-info">
-                        <?php 
-                        $u_img = !empty($order['user_image']) ? $order['user_image'] : 'res/img/user-default.png'; 
-                        ?>
-                        <img src="<?php echo $u_img; ?>" 
-                             onerror="this.onerror=null;this.src='res/img/user-default.png';" 
-                             alt="User" 
-                             class="order-user-img">
-                        
-                        <div class="order-text-group">
-                            <h4 class="order-user-name"><?php echo htmlspecialchars($order['user_name'] ?: 'Guest'); ?></h4>
-                            <p class="order-details">
-                                <?php echo htmlspecialchars($order['product_name']); ?> • ৳<?php echo number_format($order['amount'], 2); ?>
-                            </p>
-                        </div>
-                    </div>
-                    <div class="order-status">completed</div>
-                </div>
-            <?php endforeach; ?>
-        <?php else: ?>
-            <p class="text-gray-500 text-sm py-4">No recent orders found.</p>
-        <?php endif; ?>
-    </div>
-</div>
-
-
-<script>
-    let currentIdx = 0;
-    const slider = document.getElementById('slider');
-    const dots = document.querySelectorAll('.slider-dot');
-    const total = <?php echo $total_slides; ?>;
-    let autoPlayInterval;
-
-    function updateSlider() {
-        if(total <= 0 || !slider) return;
-        slider.style.transform = `translateX(-${currentIdx * 100}%)`;
-        dots.forEach((dot, index) => {
-            dot.classList.toggle('dot-active', index === currentIdx);
-            dot.classList.toggle('dot-inactive', index !== currentIdx);
         });
-    }
+    };
 
-    function startTimer() {
-        if(total > 1) {
-            autoPlayInterval = setInterval(() => {
-                currentIdx = (currentIdx + 1) % total;
-                updateSlider();
-            }, 5000);
-        }
-    }
-
-    function resetTimer() {
-        clearInterval(autoPlayInterval);
-        startTimer();
-    }
-
-    function goToSlide(index) {
-        currentIdx = index;
-        updateSlider();
-        resetTimer();
-    }
-
-    function nextSlide() {
-        currentIdx = (currentIdx + 1) % total;
-        updateSlider();
-    }
-
-    function prevSlide() {
-        currentIdx = (currentIdx - 1 + total) % total;
-        updateSlider();
-    }
-
-    let isDragging = false, startPos = 0;
-
-    if(slider) {
-        slider.addEventListener('mousedown', dragStart);
-        slider.addEventListener('touchstart', dragStart, {passive: true});
-        slider.addEventListener('mouseup', dragEnd);
-        slider.addEventListener('mouseleave', dragEnd);
-        slider.addEventListener('touchend', dragEnd);
-        slider.addEventListener('mousemove', dragAction);
-        slider.addEventListener('touchmove', dragAction, {passive: true});
-    }
-
-    function dragStart(e) {
-        isDragging = true;
-        startPos = getPositionX(e);
-        clearInterval(autoPlayInterval);
-    }
-
-    function dragAction(e) {
-        if (!isDragging) return;
-        const currentPosition = getPositionX(e);
-        const diff = currentPosition - startPos;
-        if (Math.abs(diff) > 50) {
-            if (diff > 0) prevSlide(); else nextSlide();
-            isDragging = false; 
-            resetTimer(); 
-        }
-    }
-
-    function dragEnd() {
-        if(isDragging) {
-            isDragging = false;
-            startTimer();
-        }
-    }
-
-    function getPositionX(e) { return e.type.includes('mouse') ? e.pageX : e.touches[0].clientX; }
-
-    startTimer();
+    // Render Main Charts
+    mainChartConfig(document.getElementById('mainOrdersChart'), 'Orders');
+    mainChartConfig(document.getElementById('mainUsersChart'), 'Users');
 </script>
-
-<?php 
-include 'common/footer.php'; 
-include 'common/bottom.php'; 
-?>

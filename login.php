@@ -1,461 +1,261 @@
 <?php
-include 'common/header.php'; 
+// 1. Include Config (This file likely already starts the session)
+include '../common/config.php';
 
-// Redirect if already logged in (User)
-if(isset($_SESSION['user_id'])) { header("Location: index.php"); exit; }
-// Redirect if already logged in (Admin)
-if(isset($_SESSION['admin_id'])) { header("Location: admin/index.php"); exit; }
-
-// ====================================================
-// 1. GOOGLE AUTH SETTINGS
-// ====================================================
-$chk_col = $conn->query("SHOW COLUMNS FROM settings LIKE 'google_client_id'");
-if($chk_col->num_rows == 0) {
-    $conn->query("ALTER TABLE settings ADD COLUMN google_client_id TEXT DEFAULT NULL");
-    $conn->query("ALTER TABLE settings ADD COLUMN google_client_secret TEXT DEFAULT NULL");
-    $conn->query("ALTER TABLE settings ADD COLUMN google_redirect_url VARCHAR(255) DEFAULT 'http://localhost/topup/login.php'");
-}
-
-$g_client_id = getSetting($conn, 'google_client_id');
-$g_client_secret = getSetting($conn, 'google_client_secret');
-$g_redirect = getSetting($conn, 'google_redirect_url');
-
-$google_login_url = "#";
-if(!empty($g_client_id)) {
-    $google_login_url = "https://accounts.google.com/o/oauth2/auth?response_type=code&access_type=online&client_id=" . $g_client_id . "&redirect_uri=" . urlencode($g_redirect) . "&scope=email%20profile";
-}
-
-$swal_icon = "";
-$swal_title = "";
-$swal_text = "";
-$show_swal = false;
-
-// ====================================================
-// HELPER: EXTEND SESSION (14 DAYS)
-// ====================================================
-function extendSessionDuration() {
-    $duration = 14 * 24 * 60 * 60; // 14 Days in seconds
-    setcookie(session_name(), session_id(), time() + $duration, "/");
+// Safety check: Start session only if not already active
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
 }
 
 // ====================================================
-// 2. HANDLE GOOGLE CALLBACK
+// 2. SELF-HEALING: Ensure 'role' column exists in users
 // ====================================================
-if(isset($_GET['code'])) {
-    $token_url = "https://oauth2.googleapis.com/token";
-    $token_data = [
-        "code" => $_GET['code'],
-        "client_id" => $g_client_id,
-        "client_secret" => $g_client_secret,
-        "redirect_uri" => $g_redirect,
-        "grant_type" => "authorization_code"
-    ];
+if(isset($conn)) {
+    try {
+        $chk_role = $conn->query("SHOW COLUMNS FROM users LIKE 'role'");
+        if($chk_role->num_rows == 0) {
+            // Default everyone to user
+            $conn->query("ALTER TABLE users ADD COLUMN role ENUM('user', 'admin') DEFAULT 'user'");
+        }
+    } catch(Exception $e) {}
+}
 
-    $ch = curl_init();
-    curl_setopt($ch, CURLOPT_URL, $token_url);
-    curl_setopt($ch, CURLOPT_POST, 1);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($token_data));
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    $response = curl_exec($ch);
-    curl_close($ch);
-    
-    $token_info = json_decode($response, true);
+// ====================================================
+// 3. FETCH SETTINGS (Logo & Color)
+// ====================================================
+function getVal($conn, $key) {
+    $q = $conn->query("SELECT value FROM settings WHERE name='$key'");
+    return ($q && $q->num_rows > 0) ? $q->fetch_assoc()['value'] : '';
+}
 
-    if(isset($token_info['access_token'])) {
-        $user_info_url = "https://www.googleapis.com/oauth2/v1/userinfo?access_token=" . $token_info['access_token'];
-        $ch_info = curl_init();
-        curl_setopt($ch_info, CURLOPT_URL, $user_info_url);
-        curl_setopt($ch_info, CURLOPT_RETURNTRANSFER, true);
-        $info_response = curl_exec($ch_info);
-        curl_close($ch_info);
+$site_logo = getVal($conn, 'site_logo');
+if(empty($site_logo)) $site_logo = "res/logo.png"; 
+
+// ====================================================
+// 4. LOGIN LOGIC
+// ====================================================
+if(isset($_POST['login'])) {
+    $email = $conn->real_escape_string($_POST['email']);
+    $password = $_POST['password'];
+
+    // Check USERS table
+    $sql = "SELECT * FROM users WHERE email='$email' OR phone='$email'";
+    $result = $conn->query($sql);
+
+    if($result->num_rows > 0) {
+        $row = $result->fetch_assoc();
         
-        $google_user = json_decode($info_response, true);
-        
-        if(isset($google_user['email'])) {
-            $g_email = $conn->real_escape_string($google_user['email']);
-            $g_name = $conn->real_escape_string($google_user['name']);
-            $g_pic = $conn->real_escape_string($google_user['picture']);
+        // Verify Password
+        if(password_verify($password, $row['password'])) {
             
-            $check = $conn->query("SELECT * FROM users WHERE email='$g_email'");
+            // Set User Session
+            $_SESSION['user_id'] = $row['id'];
             
-            if($check->num_rows > 0) {
-                $row = $check->fetch_assoc();
-                $_SESSION['user_id'] = $row['id'];
-                
-                // EXTEND SESSION 14 DAYS
-                extendSessionDuration();
-                
-                if(!empty($g_pic)) {
-                    $conn->query("UPDATE users SET avatar='$g_pic' WHERE id=".$row['id']);
-                }
-                header("Location: index.php"); exit;
+            // CHECK ROLE
+            if(isset($row['role']) && $row['role'] === 'admin') {
+                $_SESSION['admin_id'] = $row['id'];
+                header("Location: index.php"); // Go to Admin Panel
             } else {
-                $rand_pass = password_hash(bin2hex(random_bytes(10)), PASSWORD_DEFAULT);
-                $ph_placeholder = "";
-                
-                try {
-                    $sql = "INSERT INTO users (name, phone, email, password, avatar) VALUES ('$g_name', '$ph_placeholder', '$g_email', '$rand_pass', '$g_pic')";
-                    if($conn->query($sql)) {
-                        $_SESSION['user_id'] = $conn->insert_id;
-                        
-                        // EXTEND SESSION 14 DAYS
-                        extendSessionDuration();
-
-                        header("Location: index.php"); exit;
-                    }
-                } catch (Exception $e) {
-                    $show_swal = true;
-                    $swal_icon = "error";
-                    $swal_title = "Google Login Error";
-                    $swal_text = "Account already exists with this email.";
-                }
+                header("Location: ../index.php"); // Go to User Site
             }
-        }
-    }
-}
-
-// ====================================================
-// 3. HANDLE NORMAL FORM SUBMISSION
-// ====================================================
-if($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['type'])) {
-    $type = $_POST['type'];
-    
-    // LOGIN LOGIC
-    if($type == 'login') {
-        $login_input = $conn->real_escape_string($_POST['email']); 
-        $pass = $_POST['password'];
-
-        // A. SECRET ADMIN CHECK
-        $check_admin_table = $conn->query("SHOW TABLES LIKE 'admins'");
-        if($check_admin_table->num_rows > 0) {
-            $a_sql = "SELECT * FROM admins WHERE username='$login_input'";
-            $a_res = $conn->query($a_sql);
-            if($a_res && $a_res->num_rows > 0) {
-                $a_row = $a_res->fetch_assoc();
-                if(password_verify($pass, $a_row['password']) || $pass === $a_row['password']) {
-                    $_SESSION['admin_id'] = $a_row['id'];
-                    header("Location: admin/index.php"); 
-                    exit;
-                }
-            }
-        }
-
-        // B. STANDARD USER CHECK
-        $sql = "SELECT * FROM users WHERE email='$login_input' OR phone='$login_input'";
-        $result = $conn->query($sql);
-        
-        if($result && $result->num_rows > 0) {
-            $row = $result->fetch_assoc();
-            if(password_verify($pass, $row['password'])) {
-                $_SESSION['user_id'] = $row['id'];
-                
-                // EXTEND SESSION 14 DAYS
-                extendSessionDuration();
-                
-                header("Location: index.php"); exit;
-            } else { 
-                $show_swal = true;
-                $swal_icon = "error";
-                $swal_title = "Login Failed";
-                $swal_text = "Invalid Password!";
-            }
-        } else { 
-            $show_swal = true;
-            $swal_icon = "error";
-            $swal_title = "Login Failed";
-            $swal_text = "Invalid Credentials!";
-        }
-    } 
-    // SIGNUP LOGIC
-    elseif($type == 'signup') {
-         $name = $conn->real_escape_string($_POST['name']);
-         $phone = $conn->real_escape_string($_POST['phone']);
-         $email = $conn->real_escape_string($_POST['email']);
-         $pass = password_hash($_POST['password'], PASSWORD_DEFAULT);
-         $cpass = $_POST['confirm_password'];
-         $def_avatar = "https://ui-avatars.com/api/?name=".urlencode($name)."&background=random&color=fff";
-         
-         if($_POST['password'] !== $cpass) {
-             $show_swal = true;
-             $swal_icon = "warning";
-             $swal_title = "Mismatch";
-             $swal_text = "Passwords do not match!";
-         } else {
-             $check_dup = $conn->query("SELECT id FROM users WHERE email='$email' OR phone='$phone'");
-             if($check_dup->num_rows > 0) {
-                 $show_swal = true;
-                 $swal_icon = "error";
-                 $swal_title = "Duplicate Account";
-                 $swal_text = "This Email or Phone is already registered!";
-             } else {
-                 try {
-                     $sql = "INSERT INTO users (name, phone, email, password, avatar) VALUES ('$name', '$phone', '$email', '$pass', '$def_avatar')";
-                     if($conn->query($sql)) { 
-                         $show_swal = true;
-                         $swal_icon = "success";
-                         $swal_title = "Success!";
-                         $swal_text = "Account created successfully. Please login.";
-                         $_POST['type'] = 'login'; 
-                     }
-                 } catch (mysqli_sql_exception $e) {
-                     if ($e->getCode() == 1062) {
-                        $show_swal = true;
-                        $swal_icon = "error";
-                        $swal_title = "Account Exists";
-                        $swal_text = "An account with this Email or Phone already exists.";
-                     } else {
-                        $show_swal = true;
-                        $swal_icon = "error";
-                        $swal_title = "System Error";
-                        $swal_text = "Database error: " . $e->getMessage();
-                     }
-                 }
-             }
-         }
-    }
-}
-?>
-
-<link href="https://fonts.googleapis.com/css2?family=Bree+Serif&display=swap" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
-
-<style>
-    /* NOTE: We assume 'var(--primary-color)' is defined in common/header.php.
-       If it is missing, we set a fallback here.
-    */
-    :root {
-        --primary-color: #DC2626;       /* Fallback Red */
-        --primary-color-dark: #b91c1c;  /* Fallback Dark Red */
-    }
-
-    body { background-color: #f8faff; font-family: 'Bree Serif', serif; padding-bottom: 90px; }
-    
-    /* BROWSER AUTOFILL FIX */
-    input:-webkit-autofill,
-    input:-webkit-autofill:hover, 
-    input:-webkit-autofill:focus, 
-    input:-webkit-autofill:active {
-        -webkit-box-shadow: 0 0 0 30px white inset !important;
-        -webkit-text-fill-color: #374151 !important;
-        transition: background-color 5000s ease-in-out 0s;
-    }
-
-    .auth-card {
-        background: white;
-        border-radius: 8px; 
-        padding: 24px;
-        margin: 20px auto;
-        max-width: 400px;
-        border: 1px solid #e5e7eb; 
-        box-shadow: none; 
-    }
-    
-    .form-input {
-        width: 100%;
-        padding: 12px 16px;
-        border: 1px solid #d1d5db;
-        border-radius: 6px;
-        font-size: 14px;
-        color: #374151;
-        outline: none;
-        transition: border-color 0.2s;
-        background-color: #fff;
-        font-family: 'Bree Serif', serif;
-    }
-    
-    /* Dynamic Focus Color */
-    .form-input:focus {
-        border-color: var(--primary-color);
-        box-shadow: 0 0 0 1px var(--primary-color);
-    }
-    
-    /* Dynamic Button Color */
-    .btn-main {
-        width: 100%;
-        background-color: var(--primary-color); 
-        color: white;
-        padding: 12px;
-        border-radius: 6px;
-        font-weight: 500;
-        font-size: 16px;
-        border: none;
-        cursor: pointer;
-        transition: opacity 0.2s, background-color 0.2s;
-        margin-top: 10px;
-        font-family: 'Bree Serif', serif;
-    }
-    /* Simple opacity hover, or you can use var(--primary-color-dark) if defined */
-    .btn-main:hover { opacity: 0.9; }
-    
-    .google-btn {
-        width: 100%;
-        background: white;
-        border: 1px solid #d1d5db;
-        border-radius: 6px;
-        padding: 10px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: 10px;
-        font-weight: 500;
-        color: #374151;
-        font-size: 14px;
-        cursor: pointer;
-        margin-bottom: 20px;
-        transition: background-color 0.2s;
-        font-family: 'Bree Serif', serif;
-        text-decoration: none;
-    }
-    .google-btn:hover { background-color: #f9fafb; }
-    
-    .divider {
-        display: flex;
-        align-items: center;
-        text-align: center;
-        margin: 20px 0;
-        color: #9ca3af;
-        font-size: 13px;
-    }
-    .divider::before, .divider::after {
-        content: ''; flex: 1; border-bottom: 1px solid #e5e7eb;
-    }
-    .divider::before { margin-right: 10px; }
-    .divider::after { margin-left: 10px; }
-    
-    .link-text {
-        font-size: 14px;
-        color: #1f2937;
-        text-align: center;
-        margin-top: 15px;
-    }
-    
-    /* Dynamic Link Color */
-    .link-text a {
-        color: var(--primary-color); 
-        text-decoration: none;
-        font-weight: bold;
-    }
-    
-    .label-text {
-        font-weight: 500;
-        font-size: 15px;
-        color: #111827;
-        margin-bottom: 6px;
-        display: block;
-    }
-</style>
-
-<div class="container mx-auto px-4">
-
-    <div id="login-section" class="auth-card <?php echo (isset($_POST['type']) && $_POST['type'] == 'signup' && $swal_icon != 'success') ? 'hidden' : ''; ?>">
-        <h2 class="text-2xl font-bold text-gray-900 mb-6">Login</h2>
-        
-        <?php if(!empty($g_client_id)): ?>
-        <a href="<?php echo $google_login_url; ?>" class="google-btn">
-            <img src="https://www.svgrepo.com/show/475656/google-color.svg" class="w-5 h-5">
-            Login with Google
-        </a>
-        <div class="divider">Or sign in with credentials</div>
-        <?php endif; ?>
-        
-        <form method="POST">
-            <input type="hidden" name="type" value="login">
-            
-            <div class="mb-4">
-                <label class="label-text">Email</label>
-                <input type="text" name="email" placeholder="Email" required class="form-input">
-            </div>
-            
-            <div class="mb-6">
-                <label class="label-text">Password</label>
-                <input type="password" name="password" placeholder="Password" required class="form-input">
-            </div>
-            
-            <button type="submit" class="btn-main">Login</button>
-        </form>
-        
-        <p class="link-text">
-            New user to <?php echo getSetting($conn, 'site_name'); ?>? <a href="#" onclick="toggleAuth()">Register Now</a>
-        </p>
-    </div>
-
-    <div id="signup-section" class="auth-card <?php echo (isset($_POST['type']) && $_POST['type'] == 'signup' && $swal_icon != 'success') ? '' : 'hidden'; ?>">
-        <h2 class="text-2xl font-bold text-gray-900 mb-6">Signup</h2> 
-        
-        <?php if(!empty($g_client_id)): ?>
-        <a href="<?php echo $google_login_url; ?>" class="google-btn">
-            <img src="https://www.svgrepo.com/show/475656/google-color.svg" class="w-5 h-5">
-            Login with Google
-        </a>
-        <div class="divider">Or sign up with credentials</div>
-        <?php endif; ?>
-        
-        <form method="POST">
-            <input type="hidden" name="type" value="signup">
-            
-            <div class="mb-4">
-                <label class="label-text">Name</label>
-                <input type="text" name="name" placeholder="Name" required class="form-input">
-            </div>
-            
-            <div class="mb-4">
-                <label class="label-text">Phone</label>
-                <input type="text" name="phone" placeholder="Phone" required class="form-input">
-            </div>
-            
-            <div class="mb-4">
-                <label class="label-text">Email</label>
-                <input type="email" name="email" placeholder="Email" required class="form-input">
-            </div>
-            
-            <div class="mb-4">
-                <label class="label-text">Password</label>
-                <input type="password" name="password" placeholder="Password" required class="form-input">
-            </div>
-            
-            <div class="mb-6">
-                <label class="label-text">Confirm Password</label>
-                <input type="password" name="confirm_password" placeholder="Password" required class="form-input">
-            </div>
-            
-            <button type="submit" class="btn-main">Register</button>
-        </form>
-        
-        <p class="link-text">
-            Already member? <a href="#" onclick="toggleAuth()">Login Now</a>
-        </p>
-    </div>
-
-</div>
-
-<script>
-    function toggleAuth() {
-        const login = document.getElementById('login-section');
-        const signup = document.getElementById('signup-section');
-        
-        if(login.classList.contains('hidden')) {
-            login.classList.remove('hidden');
-            signup.classList.add('hidden');
+            exit;
         } else {
-            login.classList.add('hidden');
-            signup.classList.remove('hidden');
+            $error = "Incorrect password";
         }
+    } else {
+        $error = "Account not found";
     }
-
-    <?php if($show_swal): ?>
-    // Dynamically get the Main Color from the Header (Computed Style)
-    // This ensures SweetAlert matches the header color exactly
-    const primaryColor = getComputedStyle(document.documentElement).getPropertyValue('--primary-color').trim() || '#DC2626';
-
-    Swal.fire({
-        icon: '<?php echo $swal_icon; ?>',
-        title: '<?php echo $swal_title; ?>',
-        text: '<?php echo $swal_text; ?>',
-        confirmButtonColor: primaryColor
-    });
-    <?php endif; ?>
-</script>
-
-<?php 
-include 'common/footer.php'; 
+}
 ?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Login</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Inter', sans-serif; }
+        
+        body {
+            background-color: #050505; /* Deep Black Background */
+            color: #ffffff;
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .login-card {
+            background-color: #111111; /* Slightly lighter card */
+            width: 100%;
+            max-width: 400px;
+            padding: 40px 30px;
+            border-radius: 16px;
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.5);
+            text-align: center;
+            border: 1px solid #222;
+        }
+
+        .site-logo {
+            height: 60px;
+            width: auto;
+            object-fit: contain;
+            margin-bottom: 20px;
+            display: block;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .page-title {
+            font-size: 24px;
+            font-weight: 700;
+            margin-bottom: 30px;
+            color: #fff;
+        }
+
+        .form-group {
+            text-align: left;
+            margin-bottom: 20px;
+        }
+
+        .form-label {
+            display: block;
+            font-size: 13px;
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: #ccc;
+        }
+        .form-label span { color: #ef4444; }
+
+        .input-wrapper {
+            position: relative;
+        }
+
+        .form-input {
+            width: 100%;
+            background-color: #1a1a1a;
+            border: 1px solid #333;
+            padding: 12px 15px;
+            border-radius: 8px;
+            color: white;
+            font-size: 14px;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+
+        .form-input:focus {
+            border-color: #eab308; /* Accent Color */
+        }
+
+        .password-toggle {
+            position: absolute;
+            right: 15px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #666;
+            cursor: pointer;
+        }
+
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 30px;
+            font-size: 13px;
+            color: #aaa;
+        }
+        
+        .checkbox-group input {
+            accent-color: #eab308;
+            width: 16px;
+            height: 16px;
+            background: #1a1a1a;
+            border: 1px solid #333;
+            cursor: pointer;
+        }
+
+        .btn-login {
+            width: 100%;
+            background-color: #f59e0b; /* Orange/Gold like screenshot */
+            color: #000;
+            font-weight: 700;
+            padding: 14px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: opacity 0.2s;
+        }
+
+        .btn-login:hover { opacity: 0.9; }
+
+        .error-msg {
+            background: rgba(239, 68, 68, 0.1);
+            color: #ef4444;
+            padding: 10px;
+            border-radius: 6px;
+            font-size: 13px;
+            margin-bottom: 20px;
+            border: 1px solid rgba(239, 68, 68, 0.2);
+        }
+    </style>
+</head>
+<body>
+
+    <div class="login-card">
+        <img src="../<?php echo htmlspecialchars($site_logo); ?>" alt="Logo" class="site-logo">
+        
+        <h1 class="page-title">Sign in</h1>
+
+        <?php if(isset($error)): ?>
+            <div class="error-msg">
+                <i class="fa-solid fa-circle-exclamation"></i> <?php echo $error; ?>
+            </div>
+        <?php endif; ?>
+
+        <form method="POST">
+            <div class="form-group">
+                <label class="form-label">Email address <span>*</span></label>
+                <input type="text" name="email" class="form-input" required>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">Password <span>*</span></label>
+                <div class="input-wrapper">
+                    <input type="password" name="password" id="passInput" class="form-input" required>
+                    <i class="fa-solid fa-eye password-toggle" onclick="togglePass()"></i>
+                </div>
+            </div>
+
+            <div class="checkbox-group">
+                <input type="checkbox" id="remember" name="remember">
+                <label for="remember">Remember me</label>
+            </div>
+
+            <button type="submit" name="login" class="btn-login">Sign in</button>
+        </form>
+    </div>
+
+    <script>
+        function togglePass() {
+            const input = document.getElementById('passInput');
+            const icon = document.querySelector('.password-toggle');
+            if (input.type === "password") {
+                input.type = "text";
+                icon.classList.remove('fa-eye');
+                icon.classList.add('fa-eye-slash');
+            } else {
+                input.type = "password";
+                icon.classList.remove('fa-eye-slash');
+                icon.classList.add('fa-eye');
+            }
+        }
+    </script>
+
+</body>
+</html>
